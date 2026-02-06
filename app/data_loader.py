@@ -13,7 +13,8 @@ class DataLoader:
         """
         self.data_dir = Path(data_dir)
         self.borrowings_df = None
-        self.books_df = None
+        self.books_df = None  # This will contain ALL books (borrowed and unborrowed)
+        self.clustering_df = None
         self.user_book_matrix = None
         self.user_stats = None
         
@@ -29,26 +30,42 @@ class DataLoader:
             self.borrowings_df = pd.read_excel(borrowings_path)
             print(f"✓ Loaded {len(self.borrowings_df)} borrowing records")
             
-            # Load books catalog
-            books_path = self.data_dir / "unified_library_with_topics_isbn.csv"
-            self.books_df = pd.read_csv(books_path, encoding='utf-8')
-            print(f"✓ Loaded {len(self.books_df)} book records")
+            # Load FULL library catalog (including unborrowed books)
+            full_library_path = self.data_dir / "full_library_dataset.csv"
+            if full_library_path.exists():
+                self.books_df = pd.read_csv(full_library_path, encoding='utf-8')
+                print(f"✓ Loaded {len(self.books_df)} books from full library catalog")
+            else:
+                # Fallback to old dataset
+                books_path = self.data_dir / "unified_library_with_topics_isbn.csv"
+                self.books_df = pd.read_csv(books_path, encoding='utf-8')
+                print(f"✓ Loaded {len(self.books_df)} book records")
+            
+            # Load clustering data if available
+            clustering_path = self.data_dir / "Final_data_for_clustering.xlsx"
+            if clustering_path.exists():
+                self.clustering_df = pd.read_excel(clustering_path)
+                print(f"✓ Loaded clustering dataset with {len(self.clustering_df)} records")
             
         except Exception as e:
             raise Exception(f"Error loading data: {str(e)}")
     
     def prepare_data(self):
         """Prepare and clean data"""
-        # Clean book titles
+        # Clean book titles in borrowings
         if 'Titre' in self.borrowings_df.columns:
             self.borrowings_df['Titre'] = self.borrowings_df['Titre'].fillna('Unknown')
         
-        # Handle Titre_clean column if it exists, otherwise use Titre
+        # Handle Titre_clean column if it exists
         if 'Titre_clean' not in self.borrowings_df.columns and 'Titre' in self.borrowings_df.columns:
             self.borrowings_df['Titre_clean'] = self.borrowings_df['Titre']
-            
+        
+        # Clean book titles in full library dataset
         if 'Titre' in self.books_df.columns:
             self.books_df['Titre'] = self.books_df['Titre'].fillna('Unknown')
+        
+        if 'Titre_clean' not in self.books_df.columns and 'Titre' in self.books_df.columns:
+            self.books_df['Titre_clean'] = self.books_df['Titre']
         
         # Create user-book matrix for recommendations
         self.create_user_book_matrix()
@@ -109,7 +126,7 @@ class DataLoader:
         print(f"✓ Created user statistics for {len(self.user_stats)} users")
     
     def get_book_info(self, title):
-        """Get detailed information about a book
+        """Get detailed information about a book from full library
         
         Args:
             title: Book title
@@ -117,7 +134,38 @@ class DataLoader:
         Returns:
             DataFrame with book information
         """
-        return self.books_df[self.books_df['Titre'] == title]
+        # Try with Titre_clean first, then Titre
+        result = self.books_df[self.books_df['Titre_clean'] == title] if 'Titre_clean' in self.books_df.columns else pd.DataFrame()
+        if result.empty:
+            result = self.books_df[self.books_df['Titre'] == title]
+        return result
+    
+    def get_all_books(self):
+        """Get all books in library (borrowed and unborrowed)
+        
+        Returns:
+            DataFrame with all books
+        """
+        return self.books_df
+    
+    def get_borrowed_books_count(self):
+        """Get count of books that have been borrowed at least once
+        
+        Returns:
+            int: Number of unique borrowed books
+        """
+        title_col = 'Titre_clean' if 'Titre_clean' in self.borrowings_df.columns else 'Titre'
+        return self.borrowings_df[title_col].nunique()
+    
+    def get_unborrowed_books_count(self):
+        """Get count of books that have never been borrowed
+        
+        Returns:
+            int: Number of unborrowed books
+        """
+        if 'total_borrowed' in self.books_df.columns:
+            return len(self.books_df[self.books_df['total_borrowed'] == 0])
+        return 0
     
     def get_user_borrowed_books(self, user_id):
         """Get list of books borrowed by a user
@@ -160,12 +208,18 @@ class DataLoader:
         popular = self.borrowings_df[title_col].value_counts().head(top_n).reset_index()
         popular.columns = ['Titre', 'Count']
         
-        # Add book details
+        # Add book details from full library
         popular = popular.merge(
-            self.books_df[['Titre', 'Auteur_merged1', 'topic_fr']].drop_duplicates('Titre'),
-            on='Titre',
+            self.books_df[['Titre', 'Auteur']].drop_duplicates('Titre'),
+            left_on='Titre',
+            right_on='Titre',
             how='left'
         )
+        
+        # Add topic if available
+        if 'topic_fr' in self.books_df.columns:
+            topic_data = self.books_df[['Titre', 'topic_fr']].drop_duplicates('Titre')
+            popular = popular.merge(topic_data, on='Titre', how='left')
         
         return popular
     
@@ -211,11 +265,12 @@ class DataLoader:
         """
         stats = {
             'total_books': len(self.books_df),
+            'borrowed_books': self.get_borrowed_books_count(),
+            'unborrowed_books': self.get_unborrowed_books_count(),
             'total_borrowings': len(self.borrowings_df),
             'unique_users': self.borrowings_df['N° lecteur'].nunique(),
-            'unique_borrowed_books': self.borrowings_df['Titre'].nunique(),
             'avg_borrowings_per_user': len(self.borrowings_df) / self.borrowings_df['N° lecteur'].nunique(),
-            'avg_borrowings_per_book': len(self.borrowings_df) / self.borrowings_df['Titre'].nunique()
+            'avg_borrowings_per_book': len(self.borrowings_df) / self.get_borrowed_books_count() if self.get_borrowed_books_count() > 0 else 0
         }
         
         # Add user segmentation stats
@@ -228,7 +283,7 @@ class DataLoader:
         return stats
     
     def get_category_distribution(self):
-        """Get distribution of books by category
+        """Get distribution of books by category from full library
         
         Returns:
             Series with category counts
@@ -238,7 +293,7 @@ class DataLoader:
         return pd.Series()
     
     def get_author_statistics(self, top_n=10):
-        """Get top authors by number of books
+        """Get top authors by number of books in full library
         
         Args:
             top_n: Number of top authors to return
@@ -246,8 +301,16 @@ class DataLoader:
         Returns:
             DataFrame with author statistics
         """
-        if 'Auteur_merged1' in self.books_df.columns:
-            author_counts = self.books_df['Auteur_merged1'].value_counts().head(top_n).reset_index()
+        if 'Auteur' in self.books_df.columns:
+            author_counts = self.books_df['Auteur'].value_counts().head(top_n).reset_index()
             author_counts.columns = ['Author', 'Book Count']
             return author_counts
         return pd.DataFrame()
+    
+    def get_clustering_data(self):
+        """Get clustering dataset if available
+        
+        Returns:
+            DataFrame with clustering data or None
+        """
+        return self.clustering_df

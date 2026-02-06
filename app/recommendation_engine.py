@@ -191,17 +191,23 @@ class RecommendationEngine:
         popular['support'] = 0.0
         return popular
     
-    def get_recommendations_for_user(self, user_id, num_recommendations=10):
+    def get_recommendations_for_user(self, user_id, num_recommendations=10, method='association'):
         """Get personalized recommendations for a user
         
         Args:
             user_id: User ID
             num_recommendations: Number of recommendations
+            method: 'association', 'clustering_category', or 'clustering_advanced'
             
         Returns:
             DataFrame with recommendations
         """
-        # Get user's borrowed books
+        if method == 'clustering_category':
+            return self.get_recommendations_by_cluster(user_id, num_recommendations, mode='category')
+        elif method == 'clustering_advanced':
+            return self.get_recommendations_by_cluster(user_id, num_recommendations, mode='advanced')
+
+        # Association rules logic (default)
         user_books = self.data_loader.get_user_borrowed_books(user_id)
         
         if not user_books:
@@ -210,13 +216,15 @@ class RecommendationEngine:
         # Get recommendations for each book
         all_recommendations = []
         
-        for book in user_books[:10]:  # Limit to last 10 books to avoid too many queries
-            recs = self.get_recommendations(book, num_recommendations=5)
+        # Focus on the most recent or frequent books
+        for book in user_books[:15]:
+            recs = self.get_recommendations(book, num_recommendations=10)
             if recs is not None and len(recs) > 0:
                 all_recommendations.append(recs)
         
         if not all_recommendations:
-            return self.get_popular_recommendations(num_recommendations)
+            # Fallback to category-based clustering if no rules found
+            return self.get_recommendations_by_cluster(user_id, num_recommendations, mode='category')
         
         # Combine and aggregate
         combined = pd.concat(all_recommendations, ignore_index=True)
@@ -226,10 +234,10 @@ class RecommendationEngine:
         
         # Aggregate by book (average confidence)
         agg_dict = {'confidence': 'mean'}
-        if 'Auteur_merged1' in combined.columns:
-            agg_dict['Auteur_merged1'] = 'first'
-        if 'topic_fr' in combined.columns:
-            agg_dict['topic_fr'] = 'first'
+        for col in ['Auteur_merged1', 'topic_fr', 'Editeur', 'Auteur']:
+            if col in combined.columns:
+                agg_dict[col] = 'first'
+        
         if 'lift' in combined.columns:
             agg_dict['lift'] = 'mean'
         
@@ -239,6 +247,61 @@ class RecommendationEngine:
         aggregated = aggregated.sort_values('confidence', ascending=False).head(num_recommendations)
         
         return aggregated
+
+    def get_recommendations_by_cluster(self, user_id, num_recommendations=10, mode='category'):
+        """Get recommendations based on user clustering or attributes
+        
+        Args:
+            user_id: User ID
+            num_recommendations: Number of recommendations
+            mode: 'category' (simple) or 'advanced' (multi-feature)
+            
+        Returns:
+            DataFrame with recommendations
+        """
+        user_books = self.data_loader.get_user_borrowed_books(user_id)
+        
+        if mode == 'category':
+            user_category = self.data_loader.get_user_category(user_id)
+            # Find popular books in that category
+            category_books = self.data_loader.books_df[self.data_loader.books_df['topic_fr'] == user_category]
+            
+            if category_books.empty:
+                return self.get_popular_recommendations(num_recommendations)
+                
+            popular = self.data_loader.get_popular_books(num_recommendations * 3)
+            cluster_recs = popular.merge(
+                category_books[['Titre', 'Auteur_merged1', 'topic_fr', 'Editeur']].drop_duplicates('Titre'),
+                on='Titre',
+                how='inner'
+            )
+        else: # advanced - Placeholder logic for deeper matching
+            # Combine category matching with author preference
+            user_category = self.data_loader.get_user_category(user_id)
+            
+            # Find books from same authors user has read
+            recent_books = self.data_loader.books_df[self.data_loader.books_df['Titre'].isin(user_books)]
+            favorite_authors = recent_books['Auteur_merged1'].dropna().unique() if 'Auteur_merged1' in recent_books.columns else []
+            
+            # Mix category and author logic
+            author_books = self.data_loader.books_df[self.data_loader.books_df['Auteur_merged1'].isin(favorite_authors)]
+            category_books = self.data_loader.books_df[self.data_loader.books_df['topic_fr'] == user_category]
+            
+            cluster_recs = pd.concat([author_books, category_books]).drop_duplicates('Titre')
+            
+            # Rank by overall popularity
+            popular = self.data_loader.get_popular_books(100)
+            cluster_recs = cluster_recs.merge(popular[['Titre', 'Count']], on='Titre', how='inner')
+            cluster_recs = cluster_recs.sort_values('Count', ascending=False)
+        
+        # Filter read books
+        cluster_recs = cluster_recs[~cluster_recs['Titre'].isin(user_books)]
+        
+        # Ensure consistency
+        if 'confidence' not in cluster_recs.columns:
+            cluster_recs['confidence'] = 0.85 if mode == 'advanced' else 0.75
+            
+        return cluster_recs.head(num_recommendations)
     
     def get_rule_statistics(self):
         """Get statistics about association rules
